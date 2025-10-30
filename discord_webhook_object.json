@@ -1,0 +1,30 @@
+{
+  "username": "FloridaManFinance",
+  "avatar_url": "https://pbs.twimg.com/profile_images/1459845340996190212/bDPUvUBZ_400x400.jpg",
+  "content": "",
+  "embeds": [
+    {
+      "author": {
+        "name": "FloridaManFinance",
+        "url": "https://x.com/FloridaManFin",
+        "icon_url": "https://pbs.twimg.com/profile_images/1459845340996190212/bDPUvUBZ_400x400.jpg"
+      },
+      "title": "New Options Listings ({latest_date})",
+      "url": "https://www.theocc.com/market-data/market-data-reports/series-and-trading-data/new-listings",
+      "description": "{added}",
+      "color": 1210347,
+      "fields": [
+        {
+          "name": "Today ({total})",
+          "value": "{added}",
+          "inline": true
+        }
+        {
+          "name": "Tomorrow ({total})",
+          "value": "{added}",
+          "inline": true
+        }
+      ]
+    }
+  ]
+}
