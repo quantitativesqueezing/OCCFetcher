@@ -248,6 +248,10 @@ def parse_csv(csv_text: str, today: datetime.date) -> Dict[str, Listing]:
     """
     dedup: Dict[str, Listing] = OrderedDict()
 
+    # OCC occasionally prepends a UTF-8 BOM, which causes DictReader to expose
+    # header names like "\ufeffStock Symbol" and breaks downstream lookups.
+    csv_text = csv_text.lstrip("\ufeff")
+
     reader = csv.DictReader(StringIO(csv_text))
     for row in reader:
         ticker = (row.get("Stock Symbol") or "").strip().upper()
