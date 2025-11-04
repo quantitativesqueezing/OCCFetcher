@@ -12,6 +12,7 @@ resulting tickers.
 from __future__ import annotations
 
 import argparse
+import calendar
 import csv
 import json
 import os
@@ -19,10 +20,11 @@ import re
 import sys
 from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from functools import lru_cache
 from io import StringIO
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 from urllib.parse import parse_qs, urljoin, urlparse
 
 try:
@@ -48,10 +50,147 @@ PRIMARY_EXCHANGES = {"CBOE", "AMEX", "ARCA"}
 @dataclass
 class Listing:
     ticker: str
-    date: datetime.date
+    date: date
     company: str
     exchange: str
     flag: str
+
+
+def _observed_date(original: date) -> date:
+    """
+    Shift fixed-date holidays that fall on weekends to their observed weekday.
+    """
+    if original.weekday() == 5:  # Saturday
+        return original - timedelta(days=1)
+    if original.weekday() == 6:  # Sunday
+        return original + timedelta(days=1)
+    return original
+
+
+def _nth_weekday(year: int, month: int, weekday: int, occurrence: int) -> date:
+    """
+    Locate the nth weekday (1-indexed) in a given month.
+    """
+    if occurrence <= 0:
+        raise ValueError("occurrence must be >= 1")
+    count = 0
+    for week in calendar.monthcalendar(year, month):
+        day = week[weekday]
+        if day == 0:
+            continue
+        count += 1
+        if count == occurrence:
+            return datetime(year, month, day).date()
+    raise ValueError("Unable to locate requested weekday.")
+
+
+def _last_weekday(year: int, month: int, weekday: int) -> date:
+    """
+    Locate the last occurrence of a weekday in a month.
+    """
+    for week in reversed(calendar.monthcalendar(year, month)):
+        day = week[weekday]
+        if day != 0:
+            return datetime(year, month, day).date()
+    raise ValueError("Unable to locate requested weekday.")
+
+
+def _calculate_easter_sunday(year: int) -> date:
+    """
+    Anonymous Gregorian algorithm for Easter Sunday.
+    """
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return datetime(year, month, day).date()
+
+
+@lru_cache(maxsize=None)
+def us_market_holidays(year: int) -> Set[date]:
+    """
+    Return the set of full-day US equity market holidays for the provided year.
+    """
+    holidays: Set[date] = set()
+
+    def add(date_obj: date) -> None:
+        holidays.add(date_obj)
+
+    # Fixed-date holidays (with weekend observation).
+    new_years_day = datetime(year, 1, 1).date()
+    add(_observed_date(new_years_day))
+
+    next_new_year = datetime(year + 1, 1, 1).date()
+    observed_next_new_year = _observed_date(next_new_year)
+    if observed_next_new_year.year == year:
+        add(observed_next_new_year)
+
+    mlk_day = _nth_weekday(year, 1, calendar.MONDAY, 3)
+    add(mlk_day)
+
+    presidents_day = _nth_weekday(year, 2, calendar.MONDAY, 3)
+    add(presidents_day)
+
+    good_friday = _calculate_easter_sunday(year) - timedelta(days=2)
+    add(good_friday)
+
+    memorial_day = _last_weekday(year, 5, calendar.MONDAY)
+    add(memorial_day)
+
+    juneteenth = datetime(year, 6, 19).date()
+    add(_observed_date(juneteenth))
+
+    independence_day = datetime(year, 7, 4).date()
+    add(_observed_date(independence_day))
+
+    labor_day = _nth_weekday(year, 9, calendar.MONDAY, 1)
+    add(labor_day)
+
+    thanksgiving = _nth_weekday(year, 11, calendar.THURSDAY, 4)
+    add(thanksgiving)
+
+    christmas = datetime(year, 12, 25).date()
+    add(_observed_date(christmas))
+
+    return holidays
+
+
+def is_market_holiday(date_obj: date) -> bool:
+    """
+    Determine whether the provided date is a full US market holiday.
+    """
+    return date_obj in us_market_holidays(date_obj.year)
+
+
+def is_trading_day(date_obj: date) -> bool:
+    """
+    Return True when the date represents a standard US trading session.
+    """
+    if date_obj.weekday() >= 5:  # Saturday/Sunday
+        return False
+    if is_market_holiday(date_obj):
+        return False
+    return True
+
+
+def next_trading_day(date_obj: date) -> date:
+    """
+    Compute the next trading day strictly after the provided date.
+    """
+    candidate = date_obj + timedelta(days=1)
+    while not is_trading_day(candidate):
+        candidate += timedelta(days=1)
+    return candidate
 
 
 def create_http_client() -> requests.Session:
@@ -142,7 +281,11 @@ def locate_control(config: Dict, control_name: str) -> Dict:
     raise RuntimeError(f"Unable to find control definition for '{control_name}'.")
 
 
-def determine_target_year(session: requests.Session, years_url: str) -> int:
+def determine_target_year(
+    session: requests.Session,
+    years_url: str,
+    preferred_year: Optional[int] = None,
+) -> int:
     """
     Choose the appropriate report year, preferring the current EST year.
     """
@@ -161,7 +304,12 @@ def determine_target_year(session: requests.Session, years_url: str) -> int:
     if not years:
         raise RuntimeError("No available years returned by OCC.")
 
-    current_year = datetime.now(EST).year
+    if preferred_year is not None:
+        for year in years:
+            if year == preferred_year:
+                return year
+
+    current_year = preferred_year or datetime.now(EST).year
     for year in years:
         if year == current_year:
             return year
@@ -235,18 +383,11 @@ def fetch_csv(session: requests.Session, csv_url: str) -> str:
     return resp.text
 
 
-def within_window(row_date: datetime.date, today: datetime.date) -> bool:
+def parse_csv(csv_text: str, start_date: date) -> Dict[date, Dict[str, Listing]]:
     """
-    Determine whether the row's date matches the target day.
+    Parse the CSV and deduplicate tickers for the start date and any later dates.
     """
-    return row_date == today
-
-
-def parse_csv(csv_text: str, today: datetime.date) -> Dict[str, Listing]:
-    """
-    Parse the CSV and deduplicate tickers by earliest qualifying date.
-    """
-    dedup: Dict[str, Listing] = OrderedDict()
+    dedup: Dict[date, Dict[str, Listing]] = {}
 
     # OCC occasionally prepends a UTF-8 BOM, which causes DictReader to expose
     # header names like "\ufeffStock Symbol" and breaks downstream lookups.
@@ -265,7 +406,7 @@ def parse_csv(csv_text: str, today: datetime.date) -> Dict[str, Listing]:
             # Ignore rows without a valid activation date.
             continue
 
-        if not within_window(row_date, today):
+        if row_date < start_date:
             continue
 
         company = (row.get("Company") or "").strip()
@@ -281,20 +422,21 @@ def parse_csv(csv_text: str, today: datetime.date) -> Dict[str, Listing]:
             flag=flag,
         )
 
-        existing = dedup.get(ticker)
+        bucket = dedup.setdefault(row_date, OrderedDict())
+        existing = bucket.get(ticker)
         if existing is None:
-            dedup[ticker] = listing
+            bucket[ticker] = listing
             continue
 
         if row_date < existing.date:
-            dedup[ticker] = listing
+            bucket[ticker] = listing
             continue
 
         if row_date == existing.date:
             existing_primary = existing.exchange.upper() in PRIMARY_EXCHANGES
             current_primary = exchange_upper in PRIMARY_EXCHANGES
             if current_primary and not existing_primary:
-                dedup[ticker] = listing
+                bucket[ticker] = listing
 
     return dedup
 
@@ -310,14 +452,11 @@ def filter_primary_exchanges(listings: Iterable[Listing]) -> Iterable[Listing]:
     ]
 
 
-def resolve_env_var(name: str) -> Optional[str]:
+def _read_env_block(name: str) -> Optional[str]:
     """
-    Try to find an environment variable, falling back to values defined in .env.
+    Read the full value block for the specified variable from .env, preserving
+    comments and indentation.
     """
-    value = os.environ.get(name)
-    if value:
-        return value.strip()
-
     env_path = Path(__file__).resolve().with_name(".env")
     if not env_path.exists():
         return None
@@ -330,9 +469,6 @@ def resolve_env_var(name: str) -> Optional[str]:
 
             for raw_line in handle:
                 if collecting:
-                    stripped = raw_line.strip()
-                    if not stripped:
-                        break
                     if re.match(r"^[A-Za-z0-9_]+\s*=", raw_line):
                         break
                     buffer.append(raw_line)
@@ -342,20 +478,78 @@ def resolve_env_var(name: str) -> Optional[str]:
 
             if not buffer:
                 return None
-
-            block = "".join(buffer)
-            url_match = re.search(r"https?://[^\s\"']+", block)
-            if url_match:
-                return url_match.group(0)
-
-            stripped_block = block.strip()
-            if not stripped_block:
-                return None
-            if stripped_block.startswith('"') and stripped_block.endswith('"'):
-                return stripped_block.strip('"')
-            return stripped_block.split()[0]
+            return "".join(buffer).strip()
     except OSError:
         return None
+
+
+def _parse_webhook_entries(value: str) -> List[Tuple[str, Optional[str]]]:
+    """
+    Parse a webhook configuration block of the form:
+
+        ["https://..." => "thread_id", ...]
+
+    Returning a list of (url, optional_thread_id) tuples.
+    """
+    entries: List[Tuple[str, Optional[str]]] = []
+    cleaned_lines: List[str] = []
+
+    for line in value.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        cleaned_lines.append(stripped)
+
+    cleaned = "\n".join(cleaned_lines)
+    for match in re.finditer(r'"([^"]+)"\s*=>\s*"([^"]*)"', cleaned):
+        url = match.group(1).strip()
+        thread = match.group(2).strip()
+        if url:
+            entries.append((url, thread or None))
+    if entries:
+        return entries
+
+    # Fallback: attempt to locate URLs even if no explicit mapping syntax.
+    url_match = re.search(r"https?://[^\s\",]+", cleaned)
+    if url_match:
+        url = url_match.group(0).strip()
+        if url:
+            entries.append((url, None))
+
+    stripped = cleaned.strip()
+    if not entries and stripped:
+        token = stripped.strip('"').split()[0]
+        if token:
+            entries.append((token, None))
+
+    return entries
+
+
+def resolve_webhook_entry(name: str) -> Optional[Tuple[str, Optional[str]]]:
+    """
+    Try to resolve the webhook URL and optional thread ID from the environment or .env.
+    """
+    raw_env = os.environ.get(name)
+    if raw_env:
+        entries = _parse_webhook_entries(raw_env)
+        if entries:
+            return entries[0]
+        stripped = raw_env.strip()
+        if stripped:
+            return stripped, None
+        return None
+
+    block = _read_env_block(name)
+    if not block:
+        return None
+
+    entries = _parse_webhook_entries(block)
+    if entries:
+        return entries[0]
+    stripped_block = block.strip()
+    if stripped_block:
+        return stripped_block, None
+    return None
 
 
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -404,6 +598,11 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "Defaults to discord_webhook_object.json."
         ),
     )
+    parser.add_argument(
+        "--activation-date",
+        dest="activation_date",
+        help="Override the activation window date (YY-mm-dd).",
+    )
     return parser.parse_args(argv)
 
 
@@ -416,20 +615,28 @@ def sort_listings(listings: Iterable[Listing]) -> List[Listing]:
 
 def build_report(
     csv_url: str,
-    today: datetime.date,
-    listings: Iterable[Listing],
+    activation_date: date,
+    next_trading_date: date,
+    listings_by_date: Dict[date, Iterable[Listing]],
     primary_only: bool,
 ) -> Dict[str, Any]:
     """
     Assemble a JSON-serializable report structure from the collected listings.
     """
-    sorted_listings = sort_listings(listings)
-    tickers = [listing.ticker for listing in sorted_listings]
-    latest_date = (
-        sorted_listings[-1].date.isoformat() if sorted_listings else None
-    )
+    latest_listings = sort_listings(listings_by_date.get(activation_date, []))
 
-    listings_payload = [
+    future_dates = sorted(date_key for date_key in listings_by_date if date_key > activation_date)
+    future_dates_with_data = sorted(
+        date_key
+        for date_key in listings_by_date
+        if date_key > activation_date and listings_by_date.get(date_key)
+    )
+    next_listings: List[Listing] = []
+    for future_date in future_dates:
+        next_listings.extend(listings_by_date.get(future_date, []))
+    next_listings = sort_listings(next_listings)
+
+    latest_payload = [
         {
             "ticker": listing.ticker,
             "activation_date": listing.date.isoformat(),
@@ -437,23 +644,56 @@ def build_report(
             "exchange": listing.exchange,
             "flag": listing.flag,
         }
-        for listing in sorted_listings
+        for listing in latest_listings
+    ]
+    next_payload = [
+        {
+            "ticker": listing.ticker,
+            "activation_date": listing.date.isoformat(),
+            "company": listing.company,
+            "exchange": listing.exchange,
+            "flag": listing.flag,
+        }
+        for listing in next_listings
     ]
 
+    latest_tickers = [listing.ticker for listing in latest_listings]
+    next_tickers = [listing.ticker for listing in next_listings]
+    combined_tickers = latest_tickers + next_tickers
+    next_data_activation_date = (
+        future_dates_with_data[0].isoformat() if future_dates_with_data else None
+    )
+
+    metadata: Dict[str, Any] = {
+        "generated_at": datetime.now(EST).isoformat(),
+        "activation_date": activation_date.isoformat(),
+        "activation_window": f"{activation_date.isoformat()} (EST)",
+        "primary_exchanges_only": primary_only,
+        "source_csv": csv_url,
+    }
+    metadata["next_trading_date"] = next_trading_date.isoformat()
+    if next_data_activation_date:
+        metadata["next_listings_activation_date"] = next_data_activation_date
+
+    summary: Dict[str, Any] = {
+        "total": len(latest_payload) + len(next_payload),
+        "latest_total": len(latest_payload),
+        "next_total": len(next_payload),
+        "latest_tickers": latest_tickers,
+        "next_tickers": next_tickers,
+        "tickers": combined_tickers,
+        "latest_activation_date": activation_date.isoformat(),
+    }
+    summary["next_activation_date"] = next_data_activation_date
+    summary["next_trading_date"] = next_trading_date.isoformat()
+
     return {
-        "metadata": {
-            "generated_at": datetime.now(EST).isoformat(),
-            "activation_date": today.isoformat(),
-            "activation_window": f"{today.isoformat()} (EST)",
-            "primary_exchanges_only": primary_only,
-            "source_csv": csv_url,
+        "metadata": metadata,
+        "listings": {
+            "added_latest_date": latest_payload,
+            "added_next_date": next_payload,
         },
-        "listings": listings_payload,
-        "summary": {
-            "total": len(listings_payload),
-            "tickers": tickers,
-            "latest_activation_date": latest_date,
-        },
+        "summary": summary,
     }
 
 
@@ -495,37 +735,142 @@ def prepare_discord_payload(report: Dict[str, Any], template_path: str) -> Dict[
     template = load_discord_template(template_path)
     summary = report.get("summary", {})
     metadata = report.get("metadata", {})
+    listings_section = report.get("listings", {})
+    MAX_FIELD_LENGTH = 1024
 
-    tickers: List[str] = summary.get("tickers", []) or []
-    if tickers:
-        added_value = ", ".join(tickers)
-        latest_activation = summary.get("latest_activation_date") or metadata.get(
-            "activation_date"
-        )
-    else:
-        added_value = "No qualifying tickers in the current window."
-        latest_activation = metadata.get("activation_date")
+    def format_entries(entries: List[Dict[str, Any]], empty_message: str) -> str:
+        if not entries:
+            return empty_message
+
+        grouped: "OrderedDict[str, List[str]]" = OrderedDict()
+        for entry in entries:
+            activation = entry.get("activation_date", "")
+            ticker = entry.get("ticker", "")
+            grouped.setdefault(activation, []).append(ticker)
+
+        items = list(grouped.items())
+        total_available = sum(len(tickers) for _, tickers in items)
+        displayed = 0
+        lines: List[str] = []
+        for activation, tickers in items:
+            prefix = "" if len(items) == 1 else f"{activation}: "
+            current_text = "\n".join(lines)
+            extra_newline = 1 if lines else 0
+            available_chars = MAX_FIELD_LENGTH - len(current_text) - extra_newline - len(prefix)
+            if available_chars <= 0:
+                break
+
+            chunk: List[str] = []
+            used_chars = 0
+            for ticker in tickers:
+                token = (", " if chunk else "") + ticker
+                token_len = len(token)
+                if used_chars + token_len <= available_chars:
+                    chunk.append(ticker)
+                    used_chars += token_len
+                    displayed += 1
+                else:
+                    break
+
+            if chunk:
+                lines.append(prefix + ", ".join(chunk))
+
+            if len(chunk) < len(tickers):
+                break
+
+        hidden = total_available - displayed
+        content_text = "\n".join(lines)
+
+        def trim_text(text: str, limit: int) -> str:
+            if limit <= 0:
+                return ""
+            if len(text) <= limit:
+                return text
+            if limit == 1:
+                return "…"
+            trimmed = text[: limit - 1].rstrip(", ").rstrip()
+            if not trimmed:
+                return "…"
+            return trimmed + "…"
+
+        if hidden > 0:
+            message = f"... (+{hidden} more tickers)"
+            max_content_len = MAX_FIELD_LENGTH - len(message) - (1 if content_text else 0)
+            if max_content_len <= 0:
+                return trim_text(message, MAX_FIELD_LENGTH) or empty_message
+            content_text = trim_text(content_text, max_content_len)
+            separator = "\n" if content_text else ""
+            result = f"{content_text}{separator}{message}".strip("\n")
+            if len(result) > MAX_FIELD_LENGTH:
+                message = trim_text(
+                    message, MAX_FIELD_LENGTH - len(content_text) - (1 if content_text else 0)
+                )
+                result = f"{content_text}{separator}{message}".strip("\n")
+            return result[:MAX_FIELD_LENGTH] if result else empty_message
+
+        return content_text if content_text else empty_message
+
+    latest_entries: List[Dict[str, Any]] = listings_section.get("added_latest_date", [])
+    next_entries: List[Dict[str, Any]] = listings_section.get("added_next_date", [])
+
+    latest_text = format_entries(
+        latest_entries, "No qualifying tickers in the current window."
+    )
+    next_text = format_entries(
+        next_entries, "No qualifying tickers beyond the current window."
+    )
 
     context = {
-        "latest_date": latest_activation or "",
-        "added": added_value,
+        "latest_date": summary.get("latest_activation_date")
+        or metadata.get("activation_date")
+        or "",
+        "next_date": metadata.get("next_trading_date") or "",
+        "next_activation_date": summary.get("next_activation_date") or "",
+        "added_latest_date": latest_text,
+        "added_next_date": next_text,
+        "latest_total": str(summary.get("latest_total", 0)),
+        "next_total": str(summary.get("next_total", 0)),
+        "total": str(summary.get("total", 0)),
     }
     return _format_template(template, context)
 
 
-def post_to_discord(webhook_url: str, payload: Dict[str, Any]) -> None:
+def post_to_discord(
+    webhook_url: str, payload: Dict[str, Any], thread_id: Optional[str] = None
+) -> None:
     """
     Send the prepared payload to the Discord webhook URL.
     """
     try:
-        response = requests.post(webhook_url, json=payload, timeout=30)
+        params = {"thread_id": thread_id} if thread_id else None
+        response = requests.post(webhook_url, json=payload, params=params, timeout=30)
         response.raise_for_status()
     except requests.RequestException as exc:
-        raise RuntimeError(f"Failed to post Discord message: {exc}") from exc
+        detail = ""
+        if hasattr(exc, "response") and exc.response is not None:
+            try:
+                detail_json = exc.response.json()
+                detail = f" Response: {json.dumps(detail_json, indent=2)}"
+            except ValueError:
+                detail = f" Response: {exc.response.text.strip()}"
+        raise RuntimeError(f"Failed to post Discord message: {exc}.{detail}") from exc
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_arguments(argv)
+    override_date: Optional[date] = None
+    if args.activation_date:
+        for pattern in ("%y-%m-%d", "%Y-%m-%d"):
+            try:
+                override_date = datetime.strptime(args.activation_date, pattern).date()
+                break
+            except ValueError:
+                continue
+        if override_date is None:
+            raise SystemExit(
+                "Invalid --activation-date value. Expected YY-mm-dd (or YYYY-mm-dd)."
+            )
+
     session = create_http_client()
     config = load_config(session)
 
@@ -543,7 +888,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     years_url = build_endpoint_url(years_endpoint)
     reports_url = build_endpoint_url(reports_endpoint)
 
-    target_year = determine_target_year(session, years_url)
+    target_year = determine_target_year(
+        session,
+        years_url,
+        preferred_year=override_date.year if override_date else None,
+    )
+
+    if override_date and target_year != override_date.year:
+        print(
+            f"Warning: Requested activation year {override_date.year} not available; "
+            f"using {target_year} instead.",
+            file=sys.stderr,
+        )
 
     # Build query parameters based on config mapping.
     query_values = {"report_type": "options", "report_year": str(target_year)}
@@ -562,7 +918,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         else:
             query_params[key] = str(value_spec)
 
-    today_est = datetime.now(EST).date()
+    today_est = override_date or datetime.now(EST).date()
+    next_date = next_trading_day(today_est)
     month_slug = today_est.strftime("%B").lower()
     csv_url = fetch_month_link(session, reports_url, query_params, month_slug)
 
@@ -576,28 +933,43 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     csv_text = fetch_csv(session, csv_url)
     listings_map = parse_csv(csv_text, today_est)
 
-    listings: List[Listing] = list(listings_map.values())
-    if args.primary_only:
-        listings = list(filter_primary_exchanges(listings))
+    listings_by_date: Dict[date, List[Listing]] = {}
+    for activation in sorted(listings_map.keys()):
+        day_listings = list(listings_map[activation].values())
+        if args.primary_only:
+            day_listings = list(filter_primary_exchanges(day_listings))
+        listings_by_date[activation] = day_listings
 
-    report = build_report(csv_url, today_est, listings, args.primary_only)
+    # Ensure keys for today/next date exist even if no qualifying rows are returned.
+    listings_by_date.setdefault(today_est, [])
+    listings_by_date.setdefault(next_date, [])
+
+    report = build_report(
+        csv_url,
+        today_est,
+        next_date,
+        listings_by_date,
+        args.primary_only,
+    )
     print(json.dumps(report, indent=2))
 
-    if args.post_to_discord:
-        webhook_url: str
-        if args.discord_webhook:
-            webhook_url = args.discord_webhook
+    should_post = args.post_to_discord or args.use_test_webhook
+    if should_post:
+        entry: Optional[Tuple[str, Optional[str]]]
+        if args.use_test_webhook:
+            if args.discord_webhook:
+                entry = (args.discord_webhook, None)
+            else:
+                entry = resolve_webhook_entry("DISCORD_WEBHOOK_TEST_URL")
+        elif args.discord_webhook:
+            entry = (args.discord_webhook, None)
         else:
-            env_var = (
-                "DISCORD_WEBHOOK_TEST_URL"
-                if args.use_test_webhook
-                else "DISCORD_WEBHOOK_URL"
-            )
-            webhook_url = resolve_env_var(env_var) or ""
-        if not webhook_url:
-            if args.use_test_webhook and not args.discord_webhook:
+            entry = resolve_webhook_entry("DISCORD_WEBHOOK_URL")
+
+        if not entry or not entry[0]:
+            if args.use_test_webhook:
                 raise RuntimeError(
-                    "--discord requested but no webhook URL provided. "
+                    "--test requested but no webhook URL provided. "
                     "Pass --discord-webhook, set DISCORD_WEBHOOK_TEST_URL, "
                     "or define it in .env."
                 )
@@ -606,8 +978,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "Pass --discord-webhook, set DISCORD_WEBHOOK_URL, "
                 "or define it in .env."
             )
+
+        webhook_url, thread_id = entry
+
+        if not args.post_to_discord:
+            print(
+                "Info: --test implicitly enables Discord posting using the test webhook.",
+                file=sys.stderr,
+            )
+
         payload = prepare_discord_payload(report, args.discord_template)
-        post_to_discord(webhook_url, payload)
+        post_to_discord(webhook_url, payload, thread_id)
 
     return 0
 
