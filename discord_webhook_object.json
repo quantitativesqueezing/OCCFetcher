@@ -9,22 +9,11 @@
         "url": "https://x.com/FloridaManFin",
         "icon_url": "https://pbs.twimg.com/profile_images/1459845340996190212/bDPUvUBZ_400x400.jpg"
       },
-      "title": "New Options Listings ({latest_date} - {next_date})",
+      "title": "New Options Listings ({week_range})",
       "url": "https://www.theocc.com/market-data/market-data-reports/series-and-trading-data/new-listings",
       "description": "",
       "color": 1210347,
-      "fields": [
-        {
-          "name": "Today ({latest_date})",
-          "value": "{added_latest_date}",
-          "inline": true
-        },
-        {
-          "name": "Upcoming ({next_date})",
-          "value": "{added_next_date}",
-          "inline": true
-        }
-      ]
+      "fields": []
     }
   ]
 }

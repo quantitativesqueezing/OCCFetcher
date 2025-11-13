@@ -45,6 +45,18 @@ ENTRY_PAGE = (
 )
 EST = ZoneInfo("America/New_York")
 PRIMARY_EXCHANGES = {"CBOE", "AMEX", "ARCA"}
+LOG_APP_ID = "OCC_Fetcher"
+LOG_FILE_PATH = (
+    Path.home()
+    / "Library"
+    / "Mobile Documents"
+    / "com~apple~CloudDocs"
+    / "Development"
+    / "Projects"
+    / "OCC_Fetcher"
+    / "Logs"
+    / "webhook_post_log.json"
+)
 
 
 @dataclass
@@ -527,29 +539,105 @@ def _parse_webhook_entries(value: str) -> List[Tuple[str, Optional[str]]]:
 
 def resolve_webhook_entry(name: str) -> Optional[Tuple[str, Optional[str]]]:
     """
+    Deprecated single-entry resolver retained for backward compatibility.
+    """
+    entries = resolve_webhook_entries(name)
+    return entries[0] if entries else None
+
+
+def resolve_webhook_entries(name: str) -> List[Tuple[str, Optional[str]]]:
+    """
     Try to resolve the webhook URL and optional thread ID from the environment or .env.
     """
+    candidates: List[Tuple[str, Optional[str]]] = []
+
     raw_env = os.environ.get(name)
     if raw_env:
         entries = _parse_webhook_entries(raw_env)
         if entries:
-            return entries[0]
-        stripped = raw_env.strip()
-        if stripped:
-            return stripped, None
-        return None
+            candidates.extend(entries)
+        else:
+            stripped = raw_env.strip()
+            if stripped:
+                candidates.append((stripped, None))
+
+    if candidates:
+        return candidates
 
     block = _read_env_block(name)
     if not block:
-        return None
+        return []
 
     entries = _parse_webhook_entries(block)
     if entries:
-        return entries[0]
+        return entries
     stripped_block = block.strip()
     if stripped_block:
-        return stripped_block, None
-    return None
+        return [(stripped_block, None)]
+    return []
+
+
+def load_post_log(path: Path) -> Dict[str, str]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): str(value) for key, value in data.items()}
+
+
+def save_post_log(path: Path, data: Dict[str, str]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"Failed to write webhook post log {path}: {exc}") from exc
+
+
+def parse_log_timestamp(raw: str) -> Optional[datetime]:
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=EST)
+        return parsed
+    except ValueError:
+        pass
+    try:
+        parsed_date = datetime.strptime(raw, "%Y-%m-%d").date()
+        return datetime.combine(parsed_date, datetime.min.time(), EST)
+    except ValueError:
+        return None
+
+
+def _coerce_cli_webhook(value: str) -> List[Tuple[str, Optional[str]]]:
+    """Interpret a CLI-provided webhook reference into (url, thread_id) tuples."""
+    if not value:
+        return []
+
+    trimmed = value.strip()
+    if not trimmed:
+        return []
+
+    # Support the associative mapping syntax used in .env.
+    if "=>" in trimmed or trimmed.startswith("["):
+        entries = _parse_webhook_entries(trimmed)
+        return entries if entries else []
+
+    # Allow simple "url|thread" CLI format.
+    if "|" in trimmed:
+        url_part, thread_part = trimmed.split("|", 1)
+        url_part = url_part.strip()
+        thread_part = thread_part.strip()
+        if url_part:
+            return [(url_part, thread_part or None)]
+        return []
+
+    return [(trimmed, None)]
 
 
 def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -580,6 +668,12 @@ def parse_arguments(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
             "When posting to Discord, prefer the DISCORD_WEBHOOK_TEST_URL "
             "environment variable."
         ),
+    )
+    parser.add_argument(
+        "--force",
+        dest="force_post",
+        action="store_true",
+        help="Bypass the 24-hour Discord throttle and post immediately.",
     )
     parser.add_argument(
         "--discord-webhook",
@@ -623,46 +717,45 @@ def build_report(
     """
     Assemble a JSON-serializable report structure from the collected listings.
     """
-    latest_listings = sort_listings(listings_by_date.get(activation_date, []))
+    sorted_dates = sorted(listings_by_date.keys())
+    payloads_by_date: Dict[str, List[Dict[str, Any]]] = {}
+    dates_summary: List[Dict[str, Any]] = []
+    total_count = 0
+    combined_tickers: List[str] = []
+    next_activation_with_data: Optional[str] = None
 
-    future_dates = sorted(date_key for date_key in listings_by_date if date_key > activation_date)
-    future_dates_with_data = sorted(
-        date_key
-        for date_key in listings_by_date
-        if date_key > activation_date and listings_by_date.get(date_key)
-    )
-    next_listings: List[Listing] = []
-    for future_date in future_dates:
-        next_listings.extend(listings_by_date.get(future_date, []))
-    next_listings = sort_listings(next_listings)
+    latest_iso = activation_date.isoformat()
 
-    latest_payload = [
-        {
-            "ticker": listing.ticker,
-            "activation_date": listing.date.isoformat(),
-            "company": listing.company,
-            "exchange": listing.exchange,
-            "flag": listing.flag,
-        }
-        for listing in latest_listings
-    ]
-    next_payload = [
-        {
-            "ticker": listing.ticker,
-            "activation_date": listing.date.isoformat(),
-            "company": listing.company,
-            "exchange": listing.exchange,
-            "flag": listing.flag,
-        }
-        for listing in next_listings
-    ]
+    for current_date in sorted_dates:
+        sorted_listings = sort_listings(listings_by_date.get(current_date, []))
+        payload = [
+            {
+                "ticker": listing.ticker,
+                "activation_date": listing.date.isoformat(),
+                "company": listing.company,
+                "exchange": listing.exchange,
+                "flag": listing.flag,
+            }
+            for listing in sorted_listings
+        ]
+        iso = current_date.isoformat()
+        payloads_by_date[iso] = payload
 
-    latest_tickers = [listing.ticker for listing in latest_listings]
-    next_tickers = [listing.ticker for listing in next_listings]
-    combined_tickers = latest_tickers + next_tickers
-    next_data_activation_date = (
-        future_dates_with_data[0].isoformat() if future_dates_with_data else None
-    )
+        tickers = [listing.ticker for listing in sorted_listings]
+        combined_tickers.extend(tickers)
+
+        total_count += len(payload)
+        dates_summary.append(
+            {
+                "date": iso,
+                "weekday": current_date.strftime("%A"),
+                "total": len(payload),
+                "tickers": tickers,
+            }
+        )
+
+        if current_date > activation_date and payload and next_activation_with_data is None:
+            next_activation_with_data = iso
 
     metadata: Dict[str, Any] = {
         "generated_at": datetime.now(EST).isoformat(),
@@ -672,26 +765,36 @@ def build_report(
         "source_csv": csv_url,
     }
     metadata["next_trading_date"] = next_trading_date.isoformat()
-    if next_data_activation_date:
-        metadata["next_listings_activation_date"] = next_data_activation_date
+    if next_activation_with_data:
+        metadata["next_listings_activation_date"] = next_activation_with_data
+
+    week_start = activation_date - timedelta(days=activation_date.weekday())
+    week_end = week_start + timedelta(days=4)
+    metadata["week_start"] = week_start.isoformat()
+    metadata["week_end"] = week_end.isoformat()
+
+    latest_total = len(payloads_by_date.get(latest_iso, []))
+    next_total = sum(
+        len(payload)
+        for iso_value, payload in payloads_by_date.items()
+        if iso_value > latest_iso
+    )
 
     summary: Dict[str, Any] = {
-        "total": len(latest_payload) + len(next_payload),
-        "latest_total": len(latest_payload),
-        "next_total": len(next_payload),
-        "latest_tickers": latest_tickers,
-        "next_tickers": next_tickers,
+        "total": total_count,
+        "latest_total": latest_total,
+        "next_total": next_total,
         "tickers": combined_tickers,
         "latest_activation_date": activation_date.isoformat(),
+        "next_activation_date": next_activation_with_data,
+        "next_trading_date": next_trading_date.isoformat(),
+        "dates": dates_summary,
     }
-    summary["next_activation_date"] = next_data_activation_date
-    summary["next_trading_date"] = next_trading_date.isoformat()
 
     return {
         "metadata": metadata,
         "listings": {
-            "added_latest_date": latest_payload,
-            "added_next_date": next_payload,
+            "by_date": payloads_by_date,
         },
         "summary": summary,
     }
@@ -736,89 +839,54 @@ def prepare_discord_payload(report: Dict[str, Any], template_path: str) -> Dict[
     summary = report.get("summary", {})
     metadata = report.get("metadata", {})
     listings_section = report.get("listings", {})
+
     MAX_FIELD_LENGTH = 1024
 
-    def format_entries(entries: List[Dict[str, Any]], empty_message: str) -> str:
-        if not entries:
-            return empty_message
+    def format_ticker_values(tickers: Sequence[str], historical: bool = False) -> str:
+        if not tickers:
+            return "No new listings added." if historical else "No new listings scheduled."
 
-        grouped: "OrderedDict[str, List[str]]" = OrderedDict()
-        for entry in entries:
-            activation = entry.get("activation_date", "")
-            ticker = entry.get("ticker", "")
-            grouped.setdefault(activation, []).append(ticker)
+        result_parts: List[str] = []
+        current_length = 0
+        total = len(tickers)
+        shown = 0
 
-        items = list(grouped.items())
-        total_available = sum(len(tickers) for _, tickers in items)
-        displayed = 0
-        lines: List[str] = []
-        for activation, tickers in items:
-            prefix = "" if len(items) == 1 else f"{activation}: "
-            current_text = "\n".join(lines)
-            extra_newline = 1 if lines else 0
-            available_chars = MAX_FIELD_LENGTH - len(current_text) - extra_newline - len(prefix)
-            if available_chars <= 0:
-                break
+        for ticker in tickers:
+            token = (", " if result_parts else "") + ticker
+            token_len = len(token)
+            if current_length + token_len <= MAX_FIELD_LENGTH:
+                result_parts.append(token if result_parts else ticker)
+                current_length += token_len
+                shown += 1
+                continue
+            break
 
-            chunk: List[str] = []
-            used_chars = 0
-            for ticker in tickers:
-                token = (", " if chunk else "") + ticker
-                token_len = len(token)
-                if used_chars + token_len <= available_chars:
-                    chunk.append(ticker)
-                    used_chars += token_len
-                    displayed += 1
-                else:
-                    break
+        hidden = total - shown
+        result = "".join(result_parts)
+        if hidden <= 0:
+            return result
 
-            if chunk:
-                lines.append(prefix + ", ".join(chunk))
+        suffix = f"... (+{hidden} more tickers)"
+        if current_length + 1 + len(suffix) <= MAX_FIELD_LENGTH:
+            return f"{result}\n{suffix}"
 
-            if len(chunk) < len(tickers):
-                break
+        available = MAX_FIELD_LENGTH - len(suffix) - 1
+        if available <= 0:
+            return suffix[:MAX_FIELD_LENGTH]
 
-        hidden = total_available - displayed
-        content_text = "\n".join(lines)
+        truncated = result[:available].rstrip(", ")
+        if not truncated:
+            return suffix[:MAX_FIELD_LENGTH]
+        return f"{truncated}…\n{suffix}"
 
-        def trim_text(text: str, limit: int) -> str:
-            if limit <= 0:
-                return ""
-            if len(text) <= limit:
-                return text
-            if limit == 1:
-                return "…"
-            trimmed = text[: limit - 1].rstrip(", ").rstrip()
-            if not trimmed:
-                return "…"
-            return trimmed + "…"
-
-        if hidden > 0:
-            message = f"... (+{hidden} more tickers)"
-            max_content_len = MAX_FIELD_LENGTH - len(message) - (1 if content_text else 0)
-            if max_content_len <= 0:
-                return trim_text(message, MAX_FIELD_LENGTH) or empty_message
-            content_text = trim_text(content_text, max_content_len)
-            separator = "\n" if content_text else ""
-            result = f"{content_text}{separator}{message}".strip("\n")
-            if len(result) > MAX_FIELD_LENGTH:
-                message = trim_text(
-                    message, MAX_FIELD_LENGTH - len(content_text) - (1 if content_text else 0)
-                )
-                result = f"{content_text}{separator}{message}".strip("\n")
-            return result[:MAX_FIELD_LENGTH] if result else empty_message
-
-        return content_text if content_text else empty_message
-
-    latest_entries: List[Dict[str, Any]] = listings_section.get("added_latest_date", [])
-    next_entries: List[Dict[str, Any]] = listings_section.get("added_next_date", [])
-
-    latest_text = format_entries(
-        latest_entries, "No qualifying tickers in the current window."
-    )
-    next_text = format_entries(
-        next_entries, "No qualifying tickers beyond the current window."
-    )
+    def tickers_for_date(iso_date: str) -> List[str]:
+        payload = listings_section.get("by_date", {}).get(iso_date, []) or []
+        extracted: List[str] = []
+        for entry in payload:
+            ticker = entry.get("ticker")
+            if ticker:
+                extracted.append(ticker)
+        return extracted
 
     context = {
         "latest_date": summary.get("latest_activation_date")
@@ -826,13 +894,80 @@ def prepare_discord_payload(report: Dict[str, Any], template_path: str) -> Dict[
         or "",
         "next_date": metadata.get("next_trading_date") or "",
         "next_activation_date": summary.get("next_activation_date") or "",
-        "added_latest_date": latest_text,
-        "added_next_date": next_text,
         "latest_total": str(summary.get("latest_total", 0)),
         "next_total": str(summary.get("next_total", 0)),
         "total": str(summary.get("total", 0)),
     }
-    return _format_template(template, context)
+    week_start_iso = metadata.get("week_start")
+    week_end_iso = metadata.get("week_end")
+
+    def format_title_date(value: Optional[str]) -> Optional[str]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value).strftime("%a %m/%d/%Y")
+        except ValueError:
+            return None
+
+    week_start_display = format_title_date(week_start_iso)
+    week_end_display = format_title_date(week_end_iso)
+    activation_display = format_title_date(context["latest_date"])
+    if week_start_display and week_end_display:
+        context["week_range"] = f"{week_start_display} - {week_end_display}"
+    else:
+        context["week_range"] = activation_display or context["latest_date"]
+
+    payload = _format_template(template, context)
+
+    week_fields: List[Dict[str, Any]] = []
+
+    def parse_iso_date(value: Optional[str], default: date) -> date:
+        if not value:
+            return default
+        try:
+            return datetime.fromisoformat(value).date()
+        except ValueError:
+            return default
+
+    default_today = datetime.now(EST).date()
+    week_start_date = parse_iso_date(week_start_iso, default_today)
+    week_end_date = parse_iso_date(week_end_iso, week_start_date + timedelta(days=4))
+
+    current_day = week_start_date
+    while current_day <= week_end_date:
+        if is_trading_day(current_day):
+            iso = current_day.isoformat()
+            tickers = tickers_for_date(iso)
+            field_value = format_ticker_values(
+                tickers,
+                historical=current_day < datetime.now(EST).date(),
+            )
+            display_name = current_day.strftime("%A")
+            week_fields.append(
+                {
+                    "name": display_name,
+                    "value": field_value,
+                    "inline": True,
+                }
+            )
+        current_day += timedelta(days=1)
+
+    if not week_fields:
+        week_fields.append(
+            {
+                "name": "No Upcoming Trading Days",
+                "value": "No qualifying tickers in the current trading week.",
+                "inline": False,
+            }
+        )
+
+    embeds = payload.get("embeds")
+    if isinstance(embeds, list) and embeds:
+        embeds[0]["fields"] = week_fields
+    else:
+        payload["embeds"] = [{"fields": week_fields}]
+
+    return payload
 
 
 def post_to_discord(
@@ -931,7 +1066,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     csv_text = fetch_csv(session, csv_url)
-    listings_map = parse_csv(csv_text, today_est)
+    week_start = today_est - timedelta(days=today_est.weekday())
+    listings_map = parse_csv(csv_text, week_start)
 
     listings_by_date: Dict[date, List[Listing]] = {}
     for activation in sorted(listings_map.keys()):
@@ -955,18 +1091,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     should_post = args.post_to_discord or args.use_test_webhook
     if should_post:
-        entry: Optional[Tuple[str, Optional[str]]]
+        entries: List[Tuple[str, Optional[str]]] = []
         if args.use_test_webhook:
             if args.discord_webhook:
-                entry = (args.discord_webhook, None)
+                entries.extend(_coerce_cli_webhook(args.discord_webhook))
             else:
-                entry = resolve_webhook_entry("DISCORD_WEBHOOK_TEST_URL")
+                entries.extend(resolve_webhook_entries("DISCORD_WEBHOOK_TEST_URL"))
         elif args.discord_webhook:
-            entry = (args.discord_webhook, None)
+            entries.extend(_coerce_cli_webhook(args.discord_webhook))
         else:
-            entry = resolve_webhook_entry("DISCORD_WEBHOOK_URL")
+            entries.extend(resolve_webhook_entries("DISCORD_WEBHOOK_URL"))
 
-        if not entry or not entry[0]:
+        if not entries:
             if args.use_test_webhook:
                 raise RuntimeError(
                     "--test requested but no webhook URL provided. "
@@ -979,16 +1115,71 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 "or define it in .env."
             )
 
-        webhook_url, thread_id = entry
+        now_eastern_dt = datetime.now(EST)
+        post_log_path = LOG_FILE_PATH
+        post_log = load_post_log(post_log_path)
+        log_updated = False
 
-        if not args.post_to_discord:
-            print(
-                "Info: --test implicitly enables Discord posting using the test webhook.",
-                file=sys.stderr,
-            )
+        normalized_entries: List[Tuple[str, Optional[str]]] = []
+        seen_keys = set()
+        for url, thread in entries:
+            if not url:
+                continue
+            key = (url, thread or "")
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            normalized_entries.append((url, thread))
 
-        payload = prepare_discord_payload(report, args.discord_template)
-        post_to_discord(webhook_url, payload, thread_id)
+        for webhook_url, thread_id in normalized_entries:
+            log_key = f"{LOG_APP_ID}|{webhook_url}|{thread_id or ''}"
+
+        for webhook_url, thread_id in entries:
+            log_key = f"{LOG_APP_ID}|{webhook_url}|{thread_id or ''}"
+            legacy_key = f"{webhook_url}|{thread_id or ''}"
+
+            last_token = post_log.get(log_key)
+            legacy_used = False
+            if last_token is None and legacy_key in post_log:
+                last_token = post_log[legacy_key]
+                legacy_used = True
+
+            last_timestamp = parse_log_timestamp(last_token or "")
+            skip_post = False
+            if not args.force_post and last_timestamp:
+                if last_timestamp.tzinfo is None:
+                    last_timestamp = last_timestamp.replace(tzinfo=EST)
+                delta = now_eastern_dt - last_timestamp
+                delta_seconds = abs(delta.total_seconds())
+                if delta_seconds < 24 * 3600:
+                    if legacy_used:
+                        post_log[log_key] = last_token  # migrate legacy key
+                        del post_log[legacy_key]
+                        log_updated = True
+                    skip_post = True
+
+            if skip_post:
+                print(
+                    f"Skipping Discord webhook {webhook_url} (already posted within the last 24 hours).",
+                    file=sys.stderr,
+                )
+                continue
+
+            if not args.post_to_discord:
+                print(
+                    "Info: --test implicitly enables Discord posting using the test webhook.",
+                    file=sys.stderr,
+                )
+
+            payload = prepare_discord_payload(report, args.discord_template)
+            post_to_discord(webhook_url, payload, thread_id)
+            post_log[log_key] = now_eastern_dt.isoformat()
+            if legacy_key in post_log:
+                del post_log[legacy_key]
+            log_updated = True
+
+        if log_updated:
+            save_post_log(post_log_path, post_log)
 
     return 0
 
